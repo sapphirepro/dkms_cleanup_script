@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODROOT="/usr/lib/modules"   # on Tumbleweed this is the actual path
+DKMSROOT="/var/lib/dkms"
+
+# Collect "actually installed" kver: they have vmlinuz and it is owned by an RPM package
+declare -A keep=()
+
+for d in "$MODROOT"/*; do
+  [[ -d "$d" ]] || continue
+  kver="${d##*/}"
+  [[ -e "$d/vmlinuz" ]] || continue
+  if rpm -qf "$d/vmlinuz" >/dev/null 2>&1; then
+    keep["$kver"]=1
+  fi
+done
+
+# Safety net: never touch the currently running kernel
+keep["$(uname -r)"]=1
+
+# Function: remove DKMS entries for a specific kver
+dkms_purge_kver() {
+  local kver="$1"
+
+  # 1) cleanly: via dkms status -> dkms remove
+  if command -v dkms >/dev/null 2>&1; then
+    dkms status 2>/dev/null | while IFS= read -r line; do
+      # format: mod/ver, kver, arch: state
+      local mv kv
+      mv="$(awk -F', ' '{print $1}' <<<"$line")"
+      kv="$(awk -F', ' '{print $2}' <<<"$line")"
+      [[ "$kv" == "$kver" ]] || continue
+      sudo dkms remove "$mv" -k "$kver" --force >/dev/null 2>&1 || true
+    done
+  fi
+
+  # 2) brutish but reliable: wipe /var/lib/dkms/*/*/<kver> (and everything under it)
+  sudo bash -c "shopt -s nullglob; for p in '$DKMSROOT'/*/*/'$kver'; do rm -rf \"\$p\"; done"
+}
+
+# Walk ALL modules directories and delete those not in keep[]
+for d in "$MODROOT"/*; do
+  [[ -d "$d" ]] || continue
+  kver="${d##*/}"
+
+  if [[ -n "${keep[$kver]+x}" ]]; then
+    continue
+  fi
+
+  echo "🧹 Purging orphan kernel leftovers: $kver"
+
+  dkms_purge_kver "$kver"
+
+  # Remove remaining /usr/lib/modules/<kver> entirely
+  sudo rm -rf --one-file-system "$d"
+done
