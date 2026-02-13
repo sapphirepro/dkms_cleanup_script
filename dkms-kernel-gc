@@ -1,57 +1,163 @@
 #!/usr/bin/env bash
+# dkms-kernel-gc — openSUSE Tumbleweed orphan cleanup for DKMS + /usr/lib/modules
 set -euo pipefail
+IFS=$'\n\t'
 
-MODROOT="/usr/lib/modules"   # on Tumbleweed this is the actual path
-DKMSROOT="/var/lib/dkms"
+# ---------- config ----------
+DKMS_ROOT="/var/lib/dkms"
+MODULES_ROOT="/usr/lib/modules"
+BOOT_ROOT="/boot"
 
-# Collect "actually installed" kver: they have vmlinuz and it is owned by an RPM package
-declare -A keep=()
+# ---------- helpers ----------
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-for d in "$MODROOT"/*; do
-  [[ -d "$d" ]] || continue
-  kver="${d##*/}"
-  [[ -e "$d/vmlinuz" ]] || continue
-  if rpm -qf "$d/vmlinuz" >/dev/null 2>&1; then
-    keep["$kver"]=1
-  fi
-done
+DRY_RUN=0
+QUIET=0
 
-# Safety net: never touch the currently running kernel
-keep["$(uname -r)"]=1
-
-# Function: remove DKMS entries for a specific kver
-dkms_purge_kver() {
-  local kver="$1"
-
-  # 1) cleanly: via dkms status -> dkms remove
-  if command -v dkms >/dev/null 2>&1; then
-    dkms status 2>/dev/null | while IFS= read -r line; do
-      # format: mod/ver, kver, arch: state
-      local mv kv
-      mv="$(awk -F', ' '{print $1}' <<<"$line")"
-      kv="$(awk -F', ' '{print $2}' <<<"$line")"
-      [[ "$kv" == "$kver" ]] || continue
-      sudo dkms remove "$mv" -k "$kver" --force >/dev/null 2>&1 || true
-    done
-  fi
-
-  # 2) brutish but reliable: wipe /var/lib/dkms/*/*/<kver> (and everything under it)
-  sudo bash -c "shopt -s nullglob; for p in '$DKMSROOT'/*/*/'$kver'; do rm -rf \"\$p\"; done"
+log() {
+  (( QUIET )) && return 0
+  echo "$@"
 }
 
-# Walk ALL modules directories and delete those not in keep[]
-for d in "$MODROOT"/*; do
-  [[ -d "$d" ]] || continue
-  kver="${d##*/}"
-
-  if [[ -n "${keep[$kver]+x}" ]]; then
-    continue
+run_rm_rf() {
+  local path="$1"
+  if (( DRY_RUN )); then
+    log "[dry-run] rm -rf -- '$path'"
+  else
+    rm -rf -- "$path"
   fi
+}
 
-  echo "🧹 Purging orphan kernel leftovers: $kver"
+usage() {
+  cat <<'EOF'
+dkms-kernel-gc (openSUSE Tumbleweed)
 
-  dkms_purge_kver "$kver"
+Usage:
+  dkms-kernel-gc [--dry-run] [--quiet]
 
-  # Remove remaining /usr/lib/modules/<kver> entirely
-  sudo rm -rf --one-file-system "$d"
+Options:
+  --dry-run   Print actions, do not delete anything
+  --quiet     Less output
+EOF
+}
+
+# ---------- args ----------
+while (( $# )); do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --quiet)   QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
 done
+
+# ---------- root escalation ----------
+if [[ "${EUID}" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo -- "$0" $([[ $DRY_RUN -eq 1 ]] && echo --dry-run) $([[ $QUIET -eq 1 ]] && echo --quiet)
+  fi
+  die "Must be run as root (or install sudo)."
+fi
+
+# ---------- detect modules root ----------
+if [[ ! -d "$MODULES_ROOT" ]]; then
+  # fallback for non-usr-merge systems
+  MODULES_ROOT="/lib/modules"
+fi
+[[ -d "$MODULES_ROOT" ]] || die "Modules root not found: /usr/lib/modules or /lib/modules"
+[[ -d "$DKMS_ROOT" ]] || die "DKMS root not found: $DKMS_ROOT"
+[[ -d "$BOOT_ROOT" ]] || die "Boot root not found: $BOOT_ROOT"
+
+ARCH="$(uname -m)"
+RUNNING_KVER="$(uname -r)"
+
+# kernel tree heuristic: avoid catching junk like "updates"
+is_kernel_tree_dir() {
+  local d="$1"
+  [[ -f "$d/modules.dep" || -d "$d/kernel" || -f "$d/vmlinuz" ]]
+}
+
+# ---------- build installed kernels set ----------
+declare -A INSTALLED=()
+
+# 1) authoritative: /boot/vmlinuz-*
+shopt -s nullglob
+for f in "$BOOT_ROOT"/vmlinuz-*; do
+  [[ -e "$f" ]] || continue
+  bn="${f##*/}"
+  kver="${bn#vmlinuz-}"
+  [[ -n "$kver" ]] && INSTALLED["$kver"]=1
+done
+shopt -u nullglob
+
+# 2) safety net: modules/<kver>/vmlinuz owned by rpm
+#    (prevents accidental deletion if /boot list is unusual)
+if command -v rpm >/dev/null 2>&1; then
+  for d in "$MODULES_ROOT"/*; do
+    [[ -d "$d" ]] || continue
+    kver="${d##*/}"
+    [[ -f "$d/vmlinuz" ]] || continue
+    if rpm -qf "$d/vmlinuz" >/dev/null 2>&1; then
+      INSTALLED["$kver"]=1
+    fi
+  done
+fi
+
+# 3) never touch running kernel
+INSTALLED["$RUNNING_KVER"]=1
+
+# ---------- collect candidate kernel versions from both locations ----------
+declare -A CANDIDATE=()
+
+# A) from /var/lib/dkms/<module>/<version>/<kver>
+for mv in "$DKMS_ROOT"/*/*; do
+  [[ -d "$mv" ]] || continue
+  for kd in "$mv"/*; do
+    [[ -d "$kd" ]] || continue
+    kver="${kd##*/}"
+    # skip non-kver nodes
+    [[ "$kver" == "source" || "$kver" == "build" ]] && continue
+    # dkms kernel build dirs normally contain arch subdir
+    [[ -d "$kd/$ARCH" ]] || continue
+    CANDIDATE["$kver"]=1
+  done
+done
+
+# B) from /usr/lib/modules/<kver> (or /lib/modules/<kver>)
+for d in "$MODULES_ROOT"/*; do
+  [[ -d "$d" ]] || continue
+  is_kernel_tree_dir "$d" || continue
+  kver="${d##*/}"
+  CANDIDATE["$kver"]=1
+done
+
+# ---------- purge orphans ----------
+purge_kver_from_dkms() {
+  local kver="$1"
+  # remove exact depth-3 dkms kernel dirs: /var/lib/dkms/<mod>/<ver>/<kver>
+  # (find keeps it strict and avoids touching unrelated trees)
+  while IFS= read -r path; do
+    log "🧹 DKMS orphan dir: $path"
+    run_rm_rf "$path"
+  done < <(find "$DKMS_ROOT" -mindepth 3 -maxdepth 3 -type d -name "$kver" 2>/dev/null || true)
+}
+
+purge_kver_from_modules() {
+  local kver="$1"
+  local path="$MODULES_ROOT/$kver"
+  if [[ -d "$path" ]]; then
+    log "🧹 Modules orphan dir: $path"
+    run_rm_rf "$path"
+  fi
+}
+
+# execute
+for kver in "${!CANDIDATE[@]}"; do
+  [[ -n "${INSTALLED[$kver]+x}" ]] && continue
+  log "🧹 Purging orphan kernel leftovers: $kver"
+  purge_kver_from_dkms "$kver"
+  purge_kver_from_modules "$kver"
+done
+
+exit 0
