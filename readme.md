@@ -64,6 +64,11 @@ Enable:
 sudo systemctl daemon-reload
 sudo systemctl enable --now dkms-kernel-gc.path
 ```
+## Browse safery what is going to be removed
+
+```bash
+sudo /usr/local/sbin/dkms-kernel-gc --dry-run
+```
 
 ## Manual run
 
